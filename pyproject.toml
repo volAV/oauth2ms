@@ -1,6 +1,8 @@
 [project]
 name = "oauth2ms"
 version = "0.1.0"
+authors = [{ name = "Harish Krupo" }]
+maintainers = [{ name = "Andrey Volochay" }]
 description = "Fetch Microsoft OAuth tokens for IMAP and SMTP."
 readme = { file = "README.org", content-type = "text/plain" }
 requires-python = ">=3.14"

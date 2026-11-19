@@ -8,6 +8,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# Modified in this fork (2026): validated OAuth callbacks, failure-safe encrypted
+# cache persistence, cross-process locking, and Python package integration.
 
 import argparse
 import base64

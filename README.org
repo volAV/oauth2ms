@@ -1,6 +1,12 @@
 #+TITLE: oauth2ms: XOAUTH2 compatible O365 token fetcher
 #+STARTUP: indent
 
+This fork is maintained by Andrey Volochay and is based on
+[[https://github.com/harishkrupo/oauth2ms][Harish Krupo's oauth2ms]].
+Modified in this fork: validated OAuth callbacks, failure-safe encrypted caching,
+cross-process cache locking, and UV-based packaging and development tooling.
+The original copyright and [[file:LICENSE][Apache License 2.0]] are retained.
+
 * Table of Contents                                       :TOC_5_gh:noexport:
 - [[#overview][Overview]]
 - [[#dependencies][Dependencies]]
