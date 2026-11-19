@@ -20,15 +20,45 @@ Example configuration for emacs given in [[steps.org]].
 * Dependencies
 Requires mbsync >= 1.3.
 More information available at: https://github.com/harishkrupo/oauth2ms/issues/2#issuecomment-846464452
-This implementation requires MSAL >= 1.26.0, GnuPG, and a POSIX system with
-=fcntl.flock= support. Install the Python dependencies from =requirements.txt=.
+This implementation requires Python >= 3.14, GnuPG, and a POSIX system with
+=fcntl.flock= support. UV manages development; UV or pipx can install the application.
+Python dependencies are declared in =pyproject.toml= and locked in =uv.lock=.
+MSAL >= 1.26.0 is required for the validated OAuth flow.
 
 * Installation
-Clone the repository and install the requirements.
+Install UV using its [[https://docs.astral.sh/uv/getting-started/installation/][official instructions]], then from this checkout:
 #+begin_src sh
-  pip install -r requirements.txt
+  uv sync --locked
+  uv run --locked oauth2ms --help
 #+end_src
-Then copy the =oauth2ms= file to any location in your =$PATH=.
+UV creates the project environment in =.venv=. The checked-in =.python-version=
+selects Python 3.14, while the package supports Python 3.14 and newer.
+
+For mail clients and systemd, install the package as an isolated UV tool:
+#+begin_src sh
+  uv python install 3.14
+  uv tool install --python 3.14 .
+#+end_src
+Alternatively, install with pipx using the managed Python interpreter:
+#+begin_src sh
+  pipx install --python "$(uv python find 3.14)" .
+#+end_src
+Both installers isolate the application from the system Python. Provision Python
+3.14 first; the operating system's interpreter does not need to be upgraded.
+
+Ensure the selected installer's binary directory (normally =~/.local/bin=) is in the session
+and systemd PATH. If an older standalone =oauth2ms= exists there, back it up and
+move it aside first; do not overwrite it implicitly with =--force=. GnuPG must
+be installed separately and remain available in PATH. The packaged command keeps
+the same options and config/cache paths; do not copy individual source files.
+Application development dependencies stay in the project environment, not the
+installed tool environment.
+
+=uv tool install= resolves its own runtime environment rather than consuming the
+project lock. For an exact locked deployment, run =uv sync --locked --no-dev= in a
+stable checkout and point mail clients at its absolute =.venv/bin/oauth2ms= path.
+Do not move the checkout or its virtual environment after configuring that path.
+
 ** XDG CONFIG HOME
    For the app to locate your config file, the =$XDG_CONFIG_HOME= environment variable must be set.
    It is generally set to =$HOME/.config=.
@@ -106,11 +136,19 @@ tokens or authorization URLs. Revocation and secret rotation must be performed
 in Entra if credentials were exposed; deleting a local file is not revocation.
 
 * Verification
-Run the isolated regression suite with the Python interpreter that has the
-dependencies installed:
+Use the locked project environment for all development checks:
 #+begin_src sh
-  python3 -B -m unittest discover -s tests -v
+  uv sync --locked
+  uv run --locked ruff format --check .
+  uv run --locked ruff check .
+  uv run --locked ty check
+  uv run --locked python -B -m unittest discover -s tests -v
 #+end_src
+Ruff owns formatting and linting; TY checks both =src/= and =tests/=. Tests use
+the standard library's =unittest= runner, so no extra test framework is required.
+To apply formatting, run =uv run --locked ruff format .=. To update dependencies
+deliberately, run =uv lock --upgrade= and review the lock-file changes before
+rerunning these checks. Commit =uv.lock=; do not commit =.venv/= or tool caches.
 The tests use disposable GPG keys and synthetic cache data. They cover callback
 rejection, real encryption/decryption failures, failed atomic replacement,
 token-output suppression, file permissions, and concurrent processes. They do not

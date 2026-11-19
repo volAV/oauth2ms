@@ -1,0 +1,42 @@
+[project]
+name = "oauth2ms"
+version = "0.1.0"
+description = "Fetch Microsoft OAuth tokens for IMAP and SMTP."
+readme = { file = "README.org", content-type = "text/plain" }
+requires-python = ">=3.14"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+dependencies = [
+    "msal>=1.26.0",
+    "python-gnupg>=0.4.6",
+    "pyxdg>=0.28",
+]
+
+[project.scripts]
+oauth2ms = "oauth2ms.cli:main"
+
+[dependency-groups]
+dev = [
+    "ruff",
+    "ty",
+]
+
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/oauth2ms"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "UP", "B"]
+
+[tool.ty.environment]
+python-version = "3.14"
+
+[tool.ty.src]
+include = ["src", "tests"]
