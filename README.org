@@ -8,6 +8,8 @@
   - [[#xdg-config-home][XDG CONFIG HOME]]
 - [[#usage][Usage]]
   - [[#encryption][Encryption]]
+  - [[#credential-safety][Credential safety]]
+- [[#verification][Verification]]
 - [[#todos][TODOS]]
 
 * Overview
@@ -18,6 +20,8 @@ Example configuration for emacs given in [[steps.org]].
 * Dependencies
 Requires mbsync >= 1.3.
 More information available at: https://github.com/harishkrupo/oauth2ms/issues/2#issuecomment-846464452
+This implementation requires MSAL >= 1.26.0, GnuPG, and a POSIX system with
+=fcntl.flock= support. Install the Python dependencies from =requirements.txt=.
 
 * Installation
 Clone the repository and install the requirements.
@@ -60,6 +64,59 @@ email/fingerprint to identify the gpg key to use for encrypting and decrypting t
 #+begin_src sh
   oauth2ms -e <gpg recipient fingerprint>
 #+end_src
+
+** Credential safety
+Use =-e= on every invocation that reads or updates an encrypted cache. An empty
+recipient is rejected rather than silently switching to plaintext mode. Without
+=-e=, the cache still contains plaintext credentials: keep it private.
+
+The bootstrap file =$XDG_CONFIG_HOME/oauth2ms/config.json= must be plaintext JSON.
+Create it outside source control with owner-only permissions. Do not put client
+secrets, token caches, private keys, or their backups in Git. The cache includes a
+copy of the configuration and its client secret. Once an encrypted cache has been
+verified, remove the plaintext bootstrap file or keep only an encrypted backup.
+An encrypted cache needs the corresponding private key and an unlocked GPG agent.
+
+Encryption and decryption failures exit nonzero without printing a token or
+replacing the previous cache. Successful writes use a private temporary file,
+=fsync=, and atomic replacement. The cache directory is restricted to mode =0700=;
+cache and lock files are restricted to =0600=. Tokens are printed only after a
+changed cache has been saved successfully. Diagnostics and the =--no-browser=
+authorization URL go to stderr, so stdout remains reserved for tokens.
+
+A persistent =credentials.bin.lock= serializes the entire read/refresh/save cycle,
+including interactive authorization, across cooperating oauth2ms processes.
+Waiting mail clients can block until authorization or GPG unlocking finishes.
+Do not remove the lock file while processes are running, or let an older
+unlocked version access the same cache. File locking is intended for a local
+filesystem; it does not coordinate caches copied between machines.
+
+The callback accepts only GET requests at the configured redirect path, with one
+matching =state= and a single authorization code or error. Unrelated requests do
+not complete the flow. MSAL's authorization-code-flow API validates the transaction
+and handles PKCE; raw authorization codes and token responses are not logged.
+Keep the listener bound to localhost and register the exact redirect URI in Entra.
+A trailing slash is removed from =redirect_path= except when it is just =/=.
+
+Changing the client, scopes, or client secret requires a protected reauthorization:
+the existing cache contains a configuration snapshot and takes precedence over
+the bootstrap file. Stop mail clients, move the old cache to a private location,
+then authorize using the updated bootstrap configuration. Never publish terminal
+tokens or authorization URLs. Revocation and secret rotation must be performed
+in Entra if credentials were exposed; deleting a local file is not revocation.
+
+* Verification
+Run the isolated regression suite with the Python interpreter that has the
+dependencies installed:
+#+begin_src sh
+  python3 -B -m unittest discover -s tests -v
+#+end_src
+The tests use disposable GPG keys and synthetic cache data. They cover callback
+rejection, real encryption/decryption failures, failed atomic replacement,
+token-output suppression, file permissions, and concurrent processes. They do not
+contact Microsoft or use personal credentials. Test the browser sign-in and mail
+clients separately before replacing a working installation.
+
 
 * TODOS
 - [x] Use gpg to encrypt the fetched data

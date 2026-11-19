@@ -10,38 +10,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from xdg.BaseDirectory import (
-        load_first_config,
-        save_data_path
-        )
+from xdg.BaseDirectory import load_first_config, save_data_path
 
 import argparse
-import webbrowser
-import logging
+import base64
+import fcntl
 import json
+import os
+import secrets
+import sys
+import tempfile
+import webbrowser
+from urllib.parse import parse_qs
+from wsgiref import simple_server
+
+import gnupg
 import msal
 
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs, urlencode
-from wsgiref import simple_server
-import wsgiref.util
-import sys
-import uuid
-import pprint
-import os
-import atexit
-import base64
-import gnupg
-import io
-
-pp = pprint.PrettyPrinter(indent=4)
-
-credentials_file = save_data_path("oauth2ms") + "/credentials.bin"
-
-_LOGGER = logging.getLogger(__name__)
-
 APP_NAME = "oauth2ms"
-SUCCESS_MESSAGE = "Authorization complete."
+SUCCESS_MESSAGE = "Authorization response received. You may close this window."
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--encode-xoauth2", action="store_true", default=False,
@@ -51,18 +38,15 @@ parser.add_argument("-e", "--encrypt-using-fingerprint", action="store", default
 parser.add_argument("--gpg-home", action="store", default=None,
                     help="Set the gpg home directory")
 parser.add_argument("--no-browser", action="store_true", default=False,
-                    help="Don't open a browser with URL. Instead print the URL. Useful inside virtualized environments like WSL.")
-
-cmdline_args = parser.parse_args()
+                    help="Print the authorization URL to stderr instead of opening a browser")
 
 
 def load_config():
     config_file = load_first_config(APP_NAME, "config.json")
     if config_file is None:
-        print(f"Couldn't find configuration file. Config file must be at: $XDG_CONFIG_HOME/{APP_NAME}/config.json")
-        print("Current value of $XDG_CONFIG_HOME is {}".format(os.getenv("XDG_CONFIG_HOME")))
-        return None
-    return json.load(open(config_file, 'r'))
+        raise RuntimeError("Configuration file not found in the oauth2ms config directory")
+    with open(config_file, "r") as source:
+        return json.load(source)
 
 def build_msal_app(config, cache = None):
     return msal.ConfidentialClientApplication(
@@ -70,31 +54,40 @@ def build_msal_app(config, cache = None):
         authority="https://login.microsoftonline.com/" + config['tenant_id'],
         client_credential=config['client_secret'], token_cache=cache)
 
-def get_auth_url(config, cache, state):
-    return build_msal_app(config, cache).get_authorization_request_url(
-        config['scopes'],
-        state=state,
-        redirect_uri=config["redirect_uri"]);
 
-class WSGIRequestHandler(wsgiref.simple_server.WSGIRequestHandler):
+class WSGIRequestHandler(simple_server.WSGIRequestHandler):
     """Silence out the messages from the http server"""
     def log_message(self, format, *args):
         pass
 
 class WSGIRedirectionApp(object):
-    """WSGI app to handle the authorization redirect.
+    """Accept only a response for this authorization transaction."""
 
-    Stores the request URI and displays the given success message.
-    """
-
-    def __init__(self, message):
-        self.last_request_uri = None
-        self._success_message = message
+    def __init__(self, redirect_path, state):
+        self.auth_response = None
+        self._redirect_path = redirect_path
+        self._state = state
 
     def __call__(self, environ, start_response):
-        start_response("200 OK", [("Content-type", "text/plain; charset=utf-8")])
-        self.last_request_uri = wsgiref.util.request_uri(environ)
-        return [self._success_message.encode("utf-8")]
+        status = "400 Bad Request"
+        message = "Invalid authorization response."
+        if environ.get("REQUEST_METHOD") != "GET":
+            status = "405 Method Not Allowed"
+        elif environ.get("PATH_INFO") != self._redirect_path:
+            status = "404 Not Found"
+        else:
+            query = parse_qs(environ.get("QUERY_STRING", ""), keep_blank_values=True)
+            response = {key: values[0] for key, values in query.items()}
+            single_values = all(len(values) == 1 for values in query.values())
+            valid_state = secrets.compare_digest(
+                response.get("state", "").encode(), self._state.encode())
+            valid_result = bool(response.get("code")) != bool(response.get("error"))
+            if single_values and valid_state and valid_result:
+                self.auth_response = response
+                status = "200 OK"
+                message = SUCCESS_MESSAGE
+        start_response(status, [("Content-type", "text/plain; charset=utf-8")])
+        return [message.encode("utf-8")]
 
 def validate_config(config):
     conditions = [
@@ -109,20 +102,11 @@ def validate_config(config):
 
     return all(conditions)
 
-def build_new_app_state(crypt):
+def build_new_app_state(crypt, no_browser=False):
     cache = msal.SerializableTokenCache()
     config = load_config()
-    if config is None:
-        return None
-
     if not validate_config(config):
-        print("Invalid config")
-        print("Config must contain the keys: " +
-            "tenant_id, client_id, redirect_host, redirect_port, " +
-            "redirect_path, scopes, client_secret")
-        return None
-
-    state = str(uuid.uuid4())
+        raise RuntimeError("Invalid configuration: required OAuth settings are missing")
 
     redirect_path = config["redirect_path"]
     # Remove / at the end if present, and path is not just /
@@ -130,86 +114,88 @@ def build_new_app_state(crypt):
         redirect_path = redirect_path[:-1]
 
     config["redirect_uri"] = "http://" + config['redirect_host'] + ":" + config['redirect_port'] + redirect_path
-    auth_url = get_auth_url(config, cache, state)
-    wsgi_app = WSGIRedirectionApp(SUCCESS_MESSAGE)
-    http_server = simple_server.make_server(config['redirect_host'],
-                                            int(config['redirect_port']),
-                                            wsgi_app,
-                                            handler_class=WSGIRequestHandler)
-    if cmdline_args.no_browser:
-        print("Please navigate to this url: " + auth_url)
-    else:
-        webbrowser.open(auth_url, new=2, autoraise=True)
+    client = build_msal_app(config, cache)
+    flow = client.initiate_auth_code_flow(
+        config["scopes"], redirect_uri=config["redirect_uri"], response_mode="query")
+    if not flow.get("auth_uri") or not flow.get("state"):
+        raise RuntimeError("Could not initiate authorization")
+    wsgi_app = WSGIRedirectionApp(redirect_path, flow["state"])
+    with simple_server.make_server(
+            config["redirect_host"], int(config["redirect_port"]), wsgi_app,
+            handler_class=WSGIRequestHandler) as http_server:
+        if no_browser:
+            print("Please navigate to this url: " + flow["auth_uri"], file=sys.stderr)
+        else:
+            webbrowser.open(flow["auth_uri"], new=2, autoraise=True)
+        while wsgi_app.auth_response is None:
+            http_server.handle_request()
 
-    http_server.handle_request()
-
-    auth_response = wsgi_app.last_request_uri
-    http_server.server_close()
-    parsed_auth_response = parse_qs(auth_response)
-
-    code_key = config["redirect_uri"] + "?code"
-    if code_key not in parsed_auth_response:
-        return None
-
-    auth_code = parsed_auth_response[code_key]
-
-    result = build_msal_app(config, cache).acquire_token_by_authorization_code(
-        auth_code,
-        scopes=config['scopes'],
-        redirect_uri=config["redirect_uri"]);
-
-
-    if result.get("access_token") is None:
-        print("Something went wrong during authorization")
-        print("Server returned: {}".format(result))
-        return None
-
-    token = result["access_token"]
-    app = {}
-    app['config'] = config
-    app['cache'] = cache
-    app['crypt'] = crypt
-    return app, token
+    try:
+        result = client.acquire_token_by_auth_code_flow(flow, wsgi_app.auth_response)
+    except ValueError:
+        raise RuntimeError("Authorization response validation failed") from None
+    if not result or not result.get("access_token"):
+        raise RuntimeError("Authorization failed; check consent and tenant policy")
+    return {"config": config, "cache": cache, "crypt": crypt}, result["access_token"]
 
 def fetch_token_from_cache(app):
     config = app['config']
     cache = app['cache']
     cca = build_msal_app(config, cache)
     accounts = cca.get_accounts()
-    if cca.get_accounts:
-        result = cca.acquire_token_silent(config['scopes'], account=accounts[0])
-        return result["access_token"]
-    else:
-        None
+    if not accounts:
+        raise RuntimeError("Token cache has no account; reauthorize")
+    result = cca.acquire_token_silent(config['scopes'], account=accounts[0])
+    if not result or not result.get("access_token"):
+        raise RuntimeError("Could not refresh the access token; reauthorize")
+    return result["access_token"]
 
-def build_app_state_from_credentials(crypt):
-    # If the file is missing return None
-    if not os.path.exists(credentials_file):
+def build_app_state_from_credentials(crypt, filename):
+    if not os.path.exists(filename):
         return None
-
-    credentials = open(credentials_file, "r").read()
+    with open(filename, "r") as source:
+        os.fchmod(source.fileno(), 0o600)
+        credentials = source.read()
     if crypt:
-        gpg = crypt["gpg"]
-        credentials = str(gpg.decrypt(credentials))
-
-    # Make sure it is a valid json object
+        decrypted = crypt["gpg"].decrypt(credentials)
+        if not decrypted.ok or decrypted.returncode != 0:
+            raise RuntimeError("Could not decrypt the token cache; check the GPG key and -e")
+        credentials = str(decrypted)
     try:
         config = json.loads(credentials)
-    except:
-        print("Not a valild json file or it is ecrypted. Maybe add/remove the -e arugment?")
-        sys.exit(1)
-
-    # We don't have a token cache?
-    if config.get("token_cache") is None:
-        return None
-
-    app_state = {};
+    except ValueError:
+        raise RuntimeError("Invalid token cache; check encryption options or reauthorize") from None
+    if not isinstance(config, dict) or config.get("token_cache") is None:
+        raise RuntimeError("Credentials file has no token cache; reauthorize")
     cache = msal.SerializableTokenCache()
     cache.deserialize(config["token_cache"])
-    app_state["config"] = config
-    app_state["cache"] = cache
-    app_state["crypt"] = crypt
-    return app_state
+    return {"config": config, "cache": cache, "crypt": crypt}
+
+
+def save_credentials(app, filename):
+    config = dict(app["config"])
+    config["token_cache"] = app["cache"].serialize()
+    credentials = json.dumps(config)
+    crypt = app.get("crypt")
+    if crypt:
+        encrypted = crypt["gpg"].encrypt(credentials, crypt["fingerprint"])
+        if not encrypted.ok or encrypted.returncode != 0:
+            raise RuntimeError("Could not encrypt the token cache; previous cache preserved")
+        credentials = str(encrypted)
+
+    fd, temporary = tempfile.mkstemp(
+        prefix=".credentials-", dir=os.path.dirname(filename))
+    try:
+        with os.fdopen(fd, "w") as target:
+            target.write(credentials)
+            target.flush()
+            os.fsync(target.fileno())
+        os.replace(temporary, filename)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
 
 """
 Encode the xoauth 2 message based on:
@@ -227,39 +213,40 @@ def encode_xoauth2(app, token):
     xoauth2_bytes = user + C_A + btoken + C_A + C_A
     return base64.b64encode(xoauth2_bytes).decode("utf-8")
 
-crypt = None
-if cmdline_args.encrypt_using_fingerprint:
-    gpg_args = {"gnupghome": cmdline_args.gpg_home} if cmdline_args.gpg_home else {}
-    gpg = gnupg.GPG(**gpg_args)
-    crypt = {"gpg" : gpg,
-             "fingerprint": cmdline_args.encrypt_using_fingerprint}
+def main():
+    args = parser.parse_args()
+    if args.encrypt_using_fingerprint is not None and not args.encrypt_using_fingerprint.strip():
+        parser.error("the GPG recipient must not be empty")
+    os.umask(0o077)
+    try:
+        crypt = None
+        if args.encrypt_using_fingerprint is not None:
+            gpg_args = {"gnupghome": args.gpg_home} if args.gpg_home else {}
+            crypt = {"gpg": gnupg.GPG(**gpg_args),
+                     "fingerprint": args.encrypt_using_fingerprint}
 
-token = None
-app_state = build_app_state_from_credentials(crypt)
-if app_state is None:
-    app_state, token = build_new_app_state(crypt)
+        data_dir = save_data_path(APP_NAME)
+        os.chmod(data_dir, 0o700)
+        filename = os.path.join(data_dir, "credentials.bin")
+        # Lock a stable inode across atomic cache replacement, including refresh.
+        with open(filename + ".lock", "a") as lock:
+            os.fchmod(lock.fileno(), 0o600)
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            app = build_app_state_from_credentials(crypt, filename)
+            if app is None:
+                app, token = build_new_app_state(crypt, no_browser=args.no_browser)
+            else:
+                token = fetch_token_from_cache(app)
+            if app["cache"].has_state_changed:
+                save_credentials(app, filename)
+            if args.encode_xoauth2:
+                token = encode_xoauth2(app, token)
+            print(token)
+    except (OSError, ValueError, RuntimeError) as error:
+        print("oauth2ms: " + str(error), file=sys.stderr)
+        return 1
+    return 0
 
-if app_state is None:
-    print("Something went wrong!")
-    sys.exit(1)
 
-if token is None:
-    token = fetch_token_from_cache(app_state)
-
-if token is not None:
-    if cmdline_args.encode_xoauth2:
-        print(encode_xoauth2(app_state, token))
-    else:
-        print(token);
-
-cache = app_state['cache']
-if cache.has_state_changed:
-    config = app_state["config"]
-    config["token_cache"] = cache.serialize()
-    config_json = json.dumps(config)
-    crypt = app_state.get("crypt")
-    if crypt:
-        gpg = crypt["gpg"]
-        fingerprint = crypt["fingerprint"]
-        config_json = str(gpg.encrypt(config_json, fingerprint))
-    open(credentials_file, "w").write(config_json)
+if __name__ == "__main__":
+    sys.exit(main())
